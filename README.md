@@ -1,5 +1,5 @@
 Set-Content -Path .\README.md -Value @'
-# Bike Rental Service (Usługa Wypożyczalni Rowerów)
+# Usługa Wypożyczalni Rowerów
 
 Projekt zrealizowany w ramach laboratorium **LAB1 — Od problemu do własnej mikrousługi** w technologii **Python + FastAPI**.
 
