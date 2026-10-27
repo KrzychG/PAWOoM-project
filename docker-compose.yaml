@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  web:
+    build: .
+    ports:
+      - "8101:8101"
+    environment:
+      - DATABASE_URL=sqlite:///./app.db
+      - CACHE_PREFIX=lab2:bike-rental
+      - CACHE_TTL_SECONDS=60
+    volumes:
+      - .:/workspace
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"

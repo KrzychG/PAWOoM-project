@@ -1,80 +1,113 @@
-from fastapi import FastAPI, HTTPException, status
+import os
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
-from typing import List, Dict
+from typing import List
+
+from app.database import Base, make_database
+from app.cache import JsonCache
+from app.repository import BikeRepository
 
 class BikeSchema(BaseModel):
-    id: str = Field(..., min_length=3, max_length=10, description="Unikalny identyfikator roweru, np. BIKE-01")
-    model: str = Field(..., min_length=2, description="Model roweru, np. CityBike")
-    status: str = Field("free", description="Status: free, rented, service")
+    id: str = Field(..., min_length=3, max_length=10)
+    model: str = Field(..., min_length=2)
+    status: str = Field("free")
+
+    class Config:
+        from_attributes = True
 
 class UpdateStatusSchema(BaseModel):
-    status: str = Field(..., description="Nowy status roweru")
+    status: str = Field(...)
 
-def create_app() -> FastAPI:
-    app = FastAPI(title="Bike Rental Service", version="1.0.0")
+def create_app(database_url=None, redis_client=None):
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        db_url = database_url or os.getenv("DATABASE_URL", "sqlite:///./app.db")
+        engine, sessions = make_database(db_url)
+        
+        Base.metadata.create_all(engine)
+        
+        repo = BikeRepository(sessions)
+        repo.seed_initial_data()
+        
+        app.state.engine = engine
+        app.state.repository = repo
+        
+        # Automatyczne wykrywanie hosta Redisa w sieci Docker Compose
+        redis_host = os.getenv("REDIS_HOST", "redis")
+        
+        if redis_client is None:
+            import redis
+            actual_client = redis.Redis(
+                host=redis_host,
+                port=6379,
+                decode_responses=True,
+                socket_timeout=1.0
+            )
+        else:
+            actual_client = redis_client
+        
+        prefix = os.getenv("CACHE_PREFIX", "lab2:album12345:bike-rental-service")
+        ttl = int(os.getenv("CACHE_TTL_SECONDS", "60"))
+        
+        app.state.cache = JsonCache(actual_client, prefix=prefix, ttl=ttl, resource_name="bike")
+        app.state.redis = actual_client
+        
+        yield
+        engine.dispose()
 
-    # Baza danych w pamięci procesu
-    db_bikes: Dict[str, dict] = {
-        "BIKE-01": {"id": "BIKE-01", "model": "Veturilo Standard", "status": "free"},
-        "BIKE-02": {"id": "BIKE-02", "model": "Veturilo E-Bike", "status": "service"}
-    }
+    app = FastAPI(title="Bike Rental Service", version="2.0.0", lifespan=lifespan)
 
     @app.get("/health", status_code=status.HTTP_200_OK)
     def health_check():
         return {"status": "ok", "service": "bike-rental-service"}
 
     @app.get("/bikes", response_model=List[BikeSchema])
-    def get_all_bikes():
-        return list(db_bikes.values())
+    def get_all_bikes(request: Request):
+        return request.app.state.repository.get_all()
 
     @app.get("/bikes/{bike_id}", response_model=BikeSchema)
-    def get_bike_by_id(bike_id: str):
-        if bike_id not in db_bikes:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, 
-                detail=f"Rower o identyfikatorze {bike_id} nie istnieje."
-            )
-        return db_bikes[bike_id]
+    def get_bike_by_id(bike_id: str, request: Request, response: Response):
+        cache = request.app.state.cache
+        repo = request.app.state.repository
+        
+        cached, source = cache.get(bike_id)
+        if cached is not None:
+            response.headers["X-Cache"] = source
+            return cached
+            
+        result = repo.get(bike_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Nie znaleziono roweru o podanym ID.")
+            
+        payload = BikeSchema.model_validate(result).model_dump(mode="json")
+        if source != "BYPASS":
+            cache.put(bike_id, payload)
+            
+        response.headers["X-Cache"] = source
+        return payload
 
     @app.patch("/bikes/{bike_id}/status", response_model=BikeSchema)
-    def update_bike_status(bike_id: str, payload: UpdateStatusSchema):
-        if bike_id not in db_bikes:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, 
-                detail="Nie znaleziono roweru o podanym ID."
-            )
+    def update_bike_status(bike_id: str, payload: UpdateStatusSchema, request: Request):
+        repo = request.app.state.repository
+        cache = request.app.state.cache
         
-        current_bike = db_bikes[bike_id]
-        new_status = payload.status
         allowed_statuses = ["free", "rented", "service"]
-
-        if new_status not in allowed_statuses:
+        if payload.status not in allowed_statuses:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=422,
                 detail=f"Nieprawidłowy status. Dozwolone to: {allowed_statuses}"
             )
-
-        if current_bike["status"] == new_status:
-            return current_bike
-
-        # IMPLEMENTACJA REGUŁY BIZNESOWEJ (409 Conflict)
-        if new_status == "rented" and current_bike["status"] == "service":
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Nie można wypożyczyć roweru, który aktualnie znajduje się w naprawie (status: service)."
-            )
             
-        if new_status == "rented" and current_bike["status"] == "rented":
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Rower jest już obecnie wypożyczony."
-            )
-
-        current_bike["status"] = new_status
-        db_bikes[bike_id] = current_bike
-        
-        return current_bike
+        try:
+            updated = repo.update_status(bike_id, payload.status)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+            
+        # Unieważnienie klucza po udanym zatwierdzeniu transakcji bazy danych
+        cache.delete(bike_id)
+        return BikeSchema.model_validate(updated)
 
     return app
-
-app = create_app()
